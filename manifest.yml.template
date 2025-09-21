@@ -1,0 +1,19 @@
+output: "merged.pdf"
+overwrite: true # overwrite existing output file
+toc: # include a Table of Contents
+  outline: true # include ToC in PDF outline, otherwise use toc: true
+files:
+  - file: "input 1.pdf"
+    label: "cover"
+    pre_toc: true # first page is a cover; no ToC entry but appears in outline
+
+  - file: "input 2.pdf"
+    label: "second file"
+    toc: false # won't show in ToC, but still appears in outline
+
+  - file: "input 3.pdf"
+    label: "third file"
+    outline: false # no outline entry but appears in ToC
+
+  - file: "input 4.pdf"
+    label: "fourth file" # appears in both ToC and outline
