@@ -77,6 +77,53 @@ Precedence rules:
 - CLI options override manifest options where applicable (e.g., `--toc`, `--toc-outline`, `-f`).
 - The output path can come from CLI or manifest; CLI takes precedence.
 
+### Running `pdfmerge` Globally on Windows (PowerShell)
+
+You can set up a PowerShell function so that the `pdfmerge` command is available in any directory. This allows you to keep the code inside the project, always run the latest version, and pass input files (like `manifest.yml`) from your current working folder.
+
+#### 1. Open your PowerShell profile
+
+Your profile is a script that runs each time a new PowerShell session starts.
+
+```ps
+ni -Type File -Force $PROFILE
+notepad $PROFILE
+```
+
+#### 2. Add the wrapper function
+
+Paste this into the profile file, adjusting the path to where your project is located:
+
+```ps
+function pdfmerge {
+    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Args)
+    $proj   = "PATH_TO_PROJECT\PDF-merge-n-mark"
+    $script = "$proj\merge_pdf.py"
+    uv run --project $proj python $script @Args
+}
+```
+
+Save and close the file.
+
+#### 3. Reload the profile
+
+```ps
+. $PROFILE
+```
+
+#### 4. Use pdfmerge anywhere
+
+Now you can run the tool from any directory. Example:
+
+```ps
+cd "C:\Users\YOUR_USERNAME\Documents\MyWork"
+pdfmerge -m manifest.yml
+```
+
+- The code and dependencies come from the PDF-merge-n-mark project.
+- The manifest.yml is resolved relative to your current directory.
+- Any edits to your project code are picked up the next time you run the command (no reinstall required).
+
 ## Manifest Formats
 
 You can use either a list-style or an object-style manifest.
