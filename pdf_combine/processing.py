@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Iterable, cast
 
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import Fit
+from pypdf.generic import Fit, IndirectObject, NameObject, NumberObject, TreeObject
 
 
 def _normalize_fit_args(fit: str, raw_args: list[Any]) -> tuple[Any, ...]:
@@ -144,6 +144,74 @@ def _fit_obj(fit: str | None, fit_args: tuple[Any, ...] | None) -> Fit:
     return Fit(fit_type=fit or "/Fit", fit_args=fit_args or ())
 
 
+# --- Outline state helpers ---
+def is_outline_node_open(node: Any) -> bool:
+    if isinstance(node, dict):
+        node_dict = cast(dict[str, Any], node)
+        count_val = node_dict.get("/Count")
+        if isinstance(count_val, (int, float)):
+            return int(count_val) >= 0
+        if isinstance(count_val, NumberObject):
+            return int(count_val) >= 0
+    open_attr = getattr(cast(Any, node), "open", None)
+    if isinstance(open_attr, bool):
+        return open_attr
+    return True
+
+
+def _tree_object_from(obj: Any) -> TreeObject | None:
+    if isinstance(obj, TreeObject):
+        return obj
+    if isinstance(obj, IndirectObject):
+        try:
+            real = obj.get_object()
+        except Exception:
+            return None
+        if isinstance(real, TreeObject):
+            return real
+    if hasattr(obj, "get_object"):
+        try:
+            real = obj.get_object()
+        except Exception:
+            return None
+        if isinstance(real, TreeObject):
+            return real
+    return None
+
+
+def _recalculate_counts(node: TreeObject) -> int:
+    child_ref: Any = node.get("/First")
+    count = 0
+    while child_ref is not None:
+        child_obj = _tree_object_from(child_ref)
+        if child_obj is None:
+            break
+        count += 1
+        _recalculate_counts(child_obj)
+        next_ref = child_obj.get("/Next")
+        child_ref = next_ref
+
+    is_open = bool(node.get("/%is_open%", True))
+    sign = 1 if is_open or count == 0 else -1
+    node[NameObject("/Count")] = NumberObject(sign * count)
+    return count
+
+
+def update_outline_counts(writer: PdfWriter) -> None:
+    try:
+        root = writer.get_outline_root()
+    except Exception:
+        return
+    if not root:
+        return
+
+    root_obj = _tree_object_from(root)
+    if root_obj is None:
+        return
+
+    _recalculate_counts(root_obj)
+
+
 # --- Footnote filtering helpers ---
 def _extract_top_from_fit(
     fit: str | None, fit_args: tuple[Any, ...] | None
@@ -221,11 +289,14 @@ def _recreate_outline_under_parent(
 ) -> None:
     # Normalize to list of nodes
     try:
-        nodes: list[Any] = (
-            list(outline) if not isinstance(outline, list) else list(outline)
-        )
+        outline_iter: Iterable[Any]
+        if not isinstance(outline, list):
+            outline_iter = cast(Iterable[Any], outline)
+        else:
+            outline_iter = cast(Iterable[Any], outline)
+        nodes = list(outline_iter)
     except Exception:
-        nodes = [outline]
+        nodes = [cast(Any, outline)]
 
     last_created: Any = None
 
@@ -238,8 +309,9 @@ def _recreate_outline_under_parent(
             continue
 
         if isinstance(node, dict):
-            title = str(node.get("/Title", "Untitled"))
-            idx, fit, fit_args = _resolve_target(reader, cast(dict[str, Any], node))
+            node_dict = cast(dict[str, Any], node)
+            title = str(node_dict.get("/Title", "Untitled"))
+            idx, fit, fit_args = _resolve_target(reader, node_dict)
             # Skip footnote-like entries
             if _is_footnote_entry(title, fit, fit_args):
                 continue
@@ -249,27 +321,36 @@ def _recreate_outline_under_parent(
                     page_number=page_offset + int(idx),
                     parent=parent,
                     fit=_fit_obj(fit, fit_args),
+                    is_open=is_outline_node_open(node),
                 )
             else:
                 last_created = writer.add_outline_item(
-                    title=title, page_number=0, parent=parent
+                    title=title,
+                    page_number=0,
+                    parent=parent,
+                    is_open=is_outline_node_open(node),
                 )
         else:
             # Fallback object-like node
+            node_any = node
             title = (
-                getattr(node, "title", None)
-                or getattr(node, "name", None)
+                getattr(node_any, "title", None)
+                or getattr(node_any, "name", None)
                 or "Untitled"
             )
             try:
-                idx2 = reader.get_destination_page_number(node)  # type: ignore[arg-type]
+                idx2 = reader.get_destination_page_number(node_any)  # type: ignore[arg-type]
             except Exception:
                 idx2 = None
-            fit2: str = cast(str, getattr(node, "fit", "/Fit"))
-            fit_args_val: Any = getattr(node, "fit_args", ())
+            fit2: str = cast(str, getattr(node_any, "fit", "/Fit"))
+            fit_args_val: Any = getattr(node_any, "fit_args", ())
             fit_args2 = _normalize_fit_args(
                 fit2,
-                list(fit_args_val) if isinstance(fit_args_val, (list, tuple)) else [],
+                (
+                    list(cast(Iterable[Any], fit_args_val))
+                    if isinstance(fit_args_val, (list, tuple))
+                    else []
+                ),
             )
             # Skip footnote-like entries
             if _is_footnote_entry(str(title), fit2, fit_args2):
@@ -280,10 +361,14 @@ def _recreate_outline_under_parent(
                     page_number=page_offset + int(idx2),
                     parent=parent,
                     fit=_fit_obj(fit2, fit_args2),
+                    is_open=is_outline_node_open(node),
                 )
             else:
                 last_created = writer.add_outline_item(
-                    title=str(title), page_number=0, parent=parent
+                    title=str(title),
+                    page_number=0,
+                    parent=parent,
+                    is_open=is_outline_node_open(node),
                 )
 
 
@@ -309,7 +394,10 @@ def rebuild_outline_under_parent(reader: PdfReader, label: str) -> PdfWriter:
 
     # Top-level outline for this document
     parent = writer.add_outline_item(
-        title=label, page_number=0, fit=_fit_obj("/Fit", ())
+        title=label,
+        page_number=0,
+        fit=_fit_obj("/Fit", ()),
+        is_open=False,
     )
 
     # Source outline
@@ -322,5 +410,7 @@ def rebuild_outline_under_parent(reader: PdfReader, label: str) -> PdfWriter:
 
     if outline:
         _recreate_outline_under_parent(reader, outline, writer, parent, page_offset=0)
+
+    update_outline_counts(writer)
 
     return writer

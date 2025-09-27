@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
 import argparse
@@ -10,7 +11,12 @@ from typing import Any, Iterable, List, Sequence, TypedDict
 import yaml  # type: ignore[import-not-found]
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link  # type: ignore[import-not-found]
-from pypdf.generic import Fit  # type: ignore[import-not-found]
+from pypdf.generic import (  # type: ignore[import-not-found]
+    BooleanObject,
+    Fit,
+    NameObject,
+    NumberObject,
+)
 from pdf_combine.processing import rebuild_outline_under_parent
 
 # Optional: reportlab for generating the ToC page
@@ -276,6 +282,34 @@ def _build_toc_pdf(entries: Sequence[tuple[str, int]]) -> PdfReader:
     c.save()
     buf.seek(0)
     return PdfReader(buf)
+
+
+def _collapse_top_level_outlines(writer: PdfWriter) -> None:
+    try:
+        root = writer.get_outline_root()
+    except Exception:
+        return
+    if not root:
+        return
+
+    current = root.get("/First") if hasattr(root, "get") else None
+    while current is not None:
+        node = current.get_object()
+        if node is None or not hasattr(node, "__getitem__"):
+            break
+        node[NameObject("/%is_open%")] = BooleanObject(False)
+
+        child = node.get("/First") if hasattr(node, "get") else None
+        count = 0
+        while child is not None:
+            child_obj = child.get_object()
+            if child_obj is None:
+                break
+            count += 1
+            child = child_obj.get("/Next") if hasattr(child_obj, "get") else None
+
+        node[NameObject("/Count")] = NumberObject(-count if count else 0)
+        current = node.get("/Next") if hasattr(node, "get") else None
 
 
 def merge_pdfs(
@@ -693,6 +727,8 @@ def merge_pdfs(
             )
             writer.add_annotation(page_number=toc_page_index, annotation=annotation)
             y -= line_gap
+
+    _collapse_top_level_outlines(writer)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with open(output_resolved, "wb") as f:

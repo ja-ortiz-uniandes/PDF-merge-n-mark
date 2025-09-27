@@ -5,6 +5,7 @@ Combine multiple PDFs into a single document while preserving (and improving) na
 - Add a one-page Table of Contents (ToC) with clickable links.
 - Add a top-level outline (bookmark) per input file using its filename or a custom `label`.
 - Preserve each input PDF’s original outline, nested under its top-level label.
+- Start every top-level outline collapsed so PDF viewers hide nested bookmarks until expanded.
 - Optionally place certain PDFs before the ToC (pre-ToC). By default these are omitted from the ToC but still get a label in the outline.
 - Fine-grained control over which items appear in the ToC and/or the outline via per-file manifest keys.
 
@@ -223,7 +224,7 @@ JSON:
 - Default pre-ToC behavior: pre-ToC items are omitted from the ToC unless `toc: true` is set for that item; they still receive an outline label unless `outline: false`.
 - The ToC (if enabled) is inserted immediately after pre-ToC items and before normal files. It’s a single page with clickable links to included items.
 - ToC page numbers are 1-based; pre-ToC entries (when included) count from 1; normal entries account for pre-ToC pages + the ToC page.
-- A top-level outline label is created per input (unless excluded), and each input’s original outline is preserved under that label with original view/fit behavior (`/XYZ`, `/FitH`, `/FitV`, `/FitR`, `/Fit`, `/FitB`, `/FitBH`, `/FitBV`).
+- A top-level outline label is created per input (unless excluded), and each input’s original outline is preserved under that label with original view/fit behavior (`/XYZ`, `/FitH`, `/FitV`, `/FitR`, `/Fit`, `/FitB`, `/FitBH`, `/FitBV`). These newly created top-level labels start collapsed by default so you can expand only the sections you need.
 - The ToC itself can have a top-level outline entry when `toc.outline: true` (or CLI `--toc-outline`).
 - Encrypted PDFs: the tool attempts to open them with an empty password; if that fails, you’ll get an error.
 - Precedence: CLI flags override manifest values.
