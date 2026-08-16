@@ -40,6 +40,21 @@ uv run mypy .      # type check
 Every example below can also be run without installing, as
 `uv run merge_pdf.py ...` from the repo directory.
 
+### Updating
+
+`pdfmerge` checks GitHub for a newer release at most once a day and, if it
+finds one, prints a notice after the merge:
+
+```text
+pdfmerge 1.3.0 is available (you have 1.2.0).
+  Update with: uv tool upgrade pdf-merge-n-mark
+  Silence this with PDFMERGE_NO_UPDATE_CHECK=1
+```
+
+It never upgrades on its own, never blocks the merge, and never changes the
+exit status. The check is skipped entirely when output is piped, so scripts and
+CI logs stay clean, and pre-releases never trigger it.
+
 ## Quick Start
 
 Merge every PDF in the folder you are standing in:
@@ -90,6 +105,11 @@ pdfmerge --here "C:\Cases\Smith" --toc      # another folder, no cd needed
   `10 Annex.pdf` merge in that order rather than `1, 10, 2`. (On non-Windows
   systems a close approximation is used.)
 - The output file is never merged into itself, so re-running with `-f` is safe.
+- **PDFs this tool produced earlier are skipped**, and it says which ones. A
+  merged PDF is stamped in its metadata, so merging a folder twice under
+  different output names does not fold the first result into the second. Pass
+  `--include-merged` when you actually want that. Files named explicitly (in a
+  manifest, as arguments, or via `--pre-toc`) are always merged regardless.
 - `-o` overrides the folder-name default. **In folder mode, a relative path is
   relative to the folder being merged**, not to where you are standing, so
   `pdfmerge --here "C:\Cases\Smith" -o "Case 42.pdf"` writes

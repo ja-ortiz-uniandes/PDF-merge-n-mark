@@ -15,7 +15,9 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link  # type: ignore[import-not-found]
 from pypdf.generic import Fit  # type: ignore[import-not-found]
 
+from pdf_combine.marking import installed_version, is_our_output, stamp_output
 from pdf_combine.naming import sort_like_explorer
+from pdf_combine.updates import notify_if_outdated
 from pdf_combine.processing import (
     import_outline_from_reader,
     rebuild_outline_under_parent,
@@ -260,26 +262,51 @@ def default_output_for(directory: Path) -> Path:
     return directory / f"{stem}.pdf"
 
 
-def find_pdfs(directory: Path, *, exclude: Iterable[Path] = ()) -> List[Path]:
+def find_pdfs(
+    directory: Path,
+    *,
+    exclude: Iterable[Path] = (),
+    include_merged: bool = False,
+) -> tuple[List[Path], List[Path]]:
     """PDFs directly inside `directory`, ordered the way Explorer orders them.
 
     Not recursive. `exclude` drops paths that are handled separately - the
     output file itself, and anything already named by --pre-toc.
+
+    Returns (files_to_merge, skipped). Unless `include_merged` is set, PDFs this
+    tool produced earlier are held back, so a second run in the same folder does
+    not swallow the first run's output under a different name. This filter is
+    only ever applied to a folder scan; a file named explicitly is always
+    merged.
     """
     skip = {_path_key(p) for p in exclude}
-    found = [
+    found = sort_like_explorer(
         entry.resolve()
         for entry in directory.iterdir()
         if entry.is_file() and entry.suffix.lower() == ".pdf"
-    ]
-    return sort_like_explorer(p for p in found if _path_key(p) not in skip)
+    )
+    found = [p for p in found if _path_key(p) not in skip]
+    if include_merged:
+        return found, []
+
+    keep: List[Path] = []
+    skipped: List[Path] = []
+    for path in found:
+        (skipped if is_our_output(path) else keep).append(path)
+    return keep, skipped
 
 
 def _inputs_from_directory(
-    directory: Path, *, exclude: Iterable[Path] = ()
-) -> List[InputItem]:
+    directory: Path,
+    *,
+    exclude: Iterable[Path] = (),
+    include_merged: bool = False,
+) -> tuple[List[InputItem], List[Path]]:
     """Every PDF in `directory` as input items, in Explorer order."""
-    return _inputs_from_cli(find_pdfs(directory, exclude=exclude))
+    found, skipped = find_pdfs(
+        directory, exclude=exclude, include_merged=include_merged
+    )
+    return _inputs_from_cli(found), skipped
 
 
 MANIFEST_HEADER = """\
@@ -615,6 +642,9 @@ def merge_pdfs(
     # Restate /Count across the whole tree so viewers honour the collapsed state.
     update_outline_counts(writer)
 
+    # Mark this as our own output so a later folder scan can skip it.
+    stamp_output(writer)
+
     output_resolved.parent.mkdir(parents=True, exist_ok=True)
     with open(output_resolved, "wb") as f:
         writer.write(f)
@@ -633,7 +663,8 @@ EPILOG = """\
 manifest keys (.json, .yml, .yaml)
   A manifest is either a bare list of file entries, or an object with global
   options plus a 'files' list. Paths inside it resolve against the manifest's
-  own folder. CLI flags win over manifest values.
+  own folder. CLI flags win over manifest values. Every file it lists is
+  merged, including one this tool produced earlier.
 
   global:
     output, out    output PDF path
@@ -648,6 +679,12 @@ manifest keys (.json, .yml, .yaml)
     toc            list this file in the ToC        (default: true, or false
                                                      when pre_toc is true)
     outline        give this file an outline entry  (default: true)
+
+environment
+  PDFMERGE_NO_UPDATE_CHECK   set to any value to silence the notice shown when
+                             a newer release exists. The check runs at most
+                             once a day, only on a terminal, after the merge,
+                             and never changes the exit status.
 
 examples
   Merge everything in this folder, in Explorer's order, no ToC:
@@ -667,6 +704,9 @@ examples
   A cover page ahead of the ToC, then the rest of the folder:
     pdfmerge --here --toc --pre-toc cover.pdf
 
+  Fold an earlier merge back in as a section, on purpose:
+    pdfmerge --here --include-merged
+
   Explicit files, explicit output:
     pdfmerge -o merged.pdf --toc A.pdf B.pdf
 """
@@ -678,6 +718,13 @@ def build_parser() -> argparse.ArgumentParser:
         description=DESCRIPTION,
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"pdfmerge {installed_version()}",
+        help="Show the installed version and exit.",
     )
     parser.add_argument(
         "--here",
@@ -731,6 +778,16 @@ def build_parser() -> argparse.ArgumentParser:
             "With --here: write an editable manifest listing the folder's PDFs "
             "in order and exit without merging. Defaults to manifest.yml in that "
             "same folder; use -f to replace an existing one."
+        ),
+    )
+    parser.add_argument(
+        "--include-merged",
+        action="store_true",
+        help=(
+            "With --here: also merge PDFs this tool produced earlier, which are "
+            "skipped by default so a second run does not swallow the first run's "
+            "output. Files named explicitly - in a manifest, as arguments, or "
+            "via --pre-toc - are always merged and never need this."
         ),
     )
     parser.add_argument(
@@ -826,7 +883,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         # The output must never be fed back into itself, and --pre-toc files
         # are added separately so they can lead.
         skip = [out_path_val.resolve(), *(it["path"] for it in from_pre_toc)]
-        from_cli = _inputs_from_directory(here_dir, exclude=skip)
+        from_cli, skipped = _inputs_from_directory(
+            here_dir, exclude=skip, include_merged=args.include_merged
+        )
+        if skipped:
+            names = ", ".join(p.name for p in skipped)
+            print(
+                f"Skipping {len(skipped)} PDF(s) previously produced by pdfmerge: "
+                f"{names}\n  (use --include-merged to merge them anyway)"
+            )
 
         if args.write_manifest:
             target = Path(args.write_manifest)
@@ -883,6 +948,12 @@ def cli() -> None:
     ) as e:
         print(f"pdfmerge: {e}", file=sys.stderr)
         raise SystemExit(1) from None
+    finally:
+        # In `finally`, so every invocation gets the notice: a successful merge,
+        # a failed one, --help, --version, and a bare run. Placing it after the
+        # work rather than before means a cold cache never delays the merge
+        # itself - the output is already written by the time we look.
+        notify_if_outdated()
 
 
 if __name__ == "__main__":
