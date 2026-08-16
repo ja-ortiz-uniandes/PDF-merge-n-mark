@@ -1,6 +1,6 @@
-# Anything with debug or test
-*debug*
-*test*
+# Local scratch files (kept narrow so tests/ stays trackable)
+debug*
+scratch/
 
 # Ignore PDFs
 *.pdf
@@ -8,7 +8,17 @@
 # Ignore jsons and YAMLs
 *.json
 *.yml
-*.yaml 
+*.yaml
+
+# ...but keep the test suite and the CI workflows
+!tests/**/*.json
+!tests/**/*.yml
+!tests/**/*.yaml
+!.github/**/*.yml
+!.github/**/*.yaml
+
+# CodeGraph index (local, rebuildable with `codegraph init`)
+.codegraph/
 
 # Python-generated files
 __pycache__/

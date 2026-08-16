@@ -1,12 +1,43 @@
 [project]
 name = "pdf-merge-n-mark"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.1.0"
+description = "Merge PDFs into one document with a linked Table of Contents and a preserved, nested outline"
 readme = "README.md"
 requires-python = ">=3.13"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
-    "mypy>=1.18.1",
     "pypdf>=6.0.0",
     "pyyaml>=6.0.2",
     "reportlab>=4.4.3",
 ]
+
+[project.scripts]
+pdfmerge = "merge_pdf:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["pdf_combine", "merge_pdf.py"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18.1",
+    "pytest>=8.3.0",
+]
+
+[tool.mypy]
+# yaml and reportlab ship no inline types; stub packages for them are not
+# pinned here, so their imports are treated as untyped rather than as errors.
+[[tool.mypy.overrides]]
+module = ["yaml", "reportlab.*"]
+ignore_missing_imports = true
+follow_untyped_imports = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The project is not installed into the venv, so the repo root has to be on
+# sys.path for `merge_pdf` and `pdf_combine` to import.
+pythonpath = ["."]

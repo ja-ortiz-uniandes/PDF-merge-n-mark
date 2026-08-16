@@ -3,21 +3,24 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
-import io  # <- NEW
+import os
+import sys
 from pathlib import Path
-from typing import Any, Iterable, List, Sequence, TypedDict
+from typing import Any, Callable, Iterable, List, Sequence, TypedDict
 
 import yaml  # type: ignore[import-not-found]
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link  # type: ignore[import-not-found]
-from pypdf.generic import (  # type: ignore[import-not-found]
-    BooleanObject,
-    Fit,
-    NameObject,
-    NumberObject,
+from pypdf.generic import Fit  # type: ignore[import-not-found]
+
+from pdf_combine.naming import sort_like_explorer
+from pdf_combine.processing import (
+    import_outline_from_reader,
+    rebuild_outline_under_parent,
+    update_outline_counts,
 )
-from pdf_combine.processing import rebuild_outline_under_parent
 
 # Optional: reportlab for generating the ToC page
 try:
@@ -28,6 +31,20 @@ except ModuleNotFoundError:
     canvas = None  # type: ignore[assignment]
 
 
+# --- Table of Contents layout ---------------------------------------------
+# Shared by the page renderer and the link-annotation pass. Both must agree on
+# every value or the clickable rows drift away from the text they cover.
+TOC_TITLE = "Table of Contents"
+TOC_PAGE_SIZE: tuple[float, float] = (
+    (float(letter[0]), float(letter[1])) if letter is not None else (612.0, 792.0)
+)
+TOC_MARGIN = 54.0
+TOC_LINE_GAP = 16.0
+TOC_TITLE_FONT = ("Helvetica-Bold", 18)
+TOC_ENTRY_FONT = ("Helvetica", 11)
+TOC_PAGE_NUMBER_GUTTER = 60.0  # room reserved on the right for page numbers
+
+
 # New: structured input item so we can carry an optional label
 class InputItem(TypedDict):
     path: Path
@@ -35,6 +52,7 @@ class InputItem(TypedDict):
     pre_toc: bool  # if true, place before ToC; default: not in ToC, in outline
     toc: bool  # include in ToC entries/links (default True; if pre_toc, default False)
     outline: bool  # include in outline (default True)
+    toc_explicit: bool  # whether 'toc' was stated in the manifest rather than defaulted
 
 
 class ManifestResult(TypedDict):
@@ -57,6 +75,19 @@ def _normalize_paths(
             pp = pp.resolve()
         out.append(pp)
     return out
+
+
+def _path_key(path: Path) -> str:
+    """Comparison key for identifying the same file across inputs.
+
+    Uses ``normcase`` so the Windows-style case-insensitive filesystem does not
+    treat ``A.pdf`` and ``a.pdf`` as two different inputs.
+    """
+    return os.path.normcase(str(path))
+
+
+def _item_title(item: InputItem) -> str:
+    return str(item["label"] or item["path"].stem)
 
 
 def _load_manifest(path: Path) -> ManifestResult:
@@ -161,7 +192,14 @@ def _load_manifest(path: Path) -> ManifestResult:
         else:
             outline_val = True
 
-        if "toc" in item and not isinstance(item.get("toc"), dict):
+        toc_explicit_val = True
+        if "toc" in item:
+            if isinstance(item.get("toc"), dict):
+                raise ValueError(
+                    "Per-file 'toc' must be a boolean; the object form "
+                    "({enabled, include, outline}) is only valid at the top level "
+                    f"of the manifest. Offending entry: {item['file']}"
+                )
             toc_item_val: bool = bool(item.get("toc"))
         elif "in_toc" in item:
             toc_item_val = bool(item.get("in_toc"))
@@ -169,6 +207,7 @@ def _load_manifest(path: Path) -> ManifestResult:
             toc_item_val = not bool(item.get("toc_exclude"))
         else:
             toc_item_val = not pre_toc_val  # True normally; False for pre_toc
+            toc_explicit_val = False
         items.append(
             {
                 "path": normalized_path,
@@ -176,6 +215,7 @@ def _load_manifest(path: Path) -> ManifestResult:
                 "pre_toc": pre_toc_val,
                 "toc": toc_item_val,
                 "outline": outline_val,
+                "toc_explicit": toc_explicit_val,
             }
         )
 
@@ -188,40 +228,183 @@ def _load_manifest(path: Path) -> ManifestResult:
     }
 
 
-def _inputs_from_cli(paths: Iterable[str | Path]) -> List[InputItem]:
-    """Parse CLI inputs, supporting a flag preceding a file to mark it as pre-ToC.
+def _inputs_from_cli(
+    paths: Iterable[str | Path], *, pre_toc: bool = False, base: Path | None = None
+) -> List[InputItem]:
+    """Turn CLI paths into input items.
 
-        Supported markers (CLI):
-            --pre-toc
-
-    Examples:
-    merge_pdf.py -o out.pdf -f --toc --pre-toc pre.pdf A.pdf B.pdf
+    Relative paths resolve against the current directory, or against `base` in
+    folder mode, where a bare filename means "in the folder being merged".
+    Labels are always the filename stem: custom labels require a manifest.
     """
     out: List[InputItem] = []
-    tokens: List[str] = [str(p) for p in paths]
-    pre_toc_next = False
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok in {"--pre-toc"}:
-            pre_toc_next = True
-            i += 1
-            continue
-        # Treat token as a path
-        pp: Path = _normalize_paths([tok])[0]
+    for pp in _normalize_paths(paths, base=base):
         out.append(
             {
                 "path": pp,
                 "label": None,
-                "pre_toc": pre_toc_next,
+                "pre_toc": pre_toc,
                 # Defaults: outline True; toc True unless pre_toc
-                "toc": (False if pre_toc_next else True),
+                "toc": not pre_toc,
                 "outline": True,
+                "toc_explicit": False,
             }
         )
-        pre_toc_next = False
-        i += 1
     return out
+
+
+def default_output_for(directory: Path) -> Path:
+    """Output path used by --here: the folder's own name."""
+    directory = directory.resolve()
+    stem = directory.name or "merged"  # a drive root has no name
+    return directory / f"{stem}.pdf"
+
+
+def find_pdfs(directory: Path, *, exclude: Iterable[Path] = ()) -> List[Path]:
+    """PDFs directly inside `directory`, ordered the way Explorer orders them.
+
+    Not recursive. `exclude` drops paths that are handled separately - the
+    output file itself, and anything already named by --pre-toc.
+    """
+    skip = {_path_key(p) for p in exclude}
+    found = [
+        entry.resolve()
+        for entry in directory.iterdir()
+        if entry.is_file() and entry.suffix.lower() == ".pdf"
+    ]
+    return sort_like_explorer(p for p in found if _path_key(p) not in skip)
+
+
+def _inputs_from_directory(
+    directory: Path, *, exclude: Iterable[Path] = ()
+) -> List[InputItem]:
+    """Every PDF in `directory` as input items, in Explorer order."""
+    return _inputs_from_cli(find_pdfs(directory, exclude=exclude))
+
+
+MANIFEST_HEADER = """\
+# Generated by `pdfmerge --here --write-manifest`.
+# Reorder or delete entries, then run: pdfmerge -m {name}
+#
+# Per-file keys:
+#   label:    outline title for the file (defaults to the filename)
+#   pre_toc:  place before the ToC; then toc defaults to false
+#   toc:      list this file in the Table of Contents (default true)
+#   outline:  give this file an outline entry (default true)
+"""
+
+
+def _manifest_path_value(path: Path, base: Path) -> str:
+    """Shortest way to name `path` from a manifest living in `base`.
+
+    Manifest paths resolve against the manifest's own folder, so a plain
+    filename is enough for anything alongside it.
+    """
+    try:
+        return str(path.resolve().relative_to(base.resolve()))
+    except ValueError:
+        return str(path.resolve())
+
+
+def build_manifest_text(pdfs: Sequence[Path], output: Path, target: Path) -> str:
+    """Render an editable manifest listing `pdfs` in order."""
+
+    def quote(value: str) -> str:
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    base = target.parent
+    lines = [MANIFEST_HEADER.format(name=target.name)]
+    lines.append(f"output: {quote(_manifest_path_value(output, base))}")
+    lines.append("overwrite: false")
+    lines.append("toc: false # or: toc: {enabled: true, outline: true}")
+    lines.append("files:")
+    for pdf in pdfs:
+        lines.append(f"  - file: {quote(_manifest_path_value(pdf, base))}")
+        lines.append(f"    label: {quote(pdf.stem)}")
+    return "\n".join(lines) + "\n"
+
+
+def write_manifest(
+    target: Path, pdfs: Sequence[Path], output: Path, *, overwrite: bool = False
+) -> None:
+    if not overwrite and target.exists():
+        raise FileExistsError(f"Manifest already exists: {target} (use -f to replace)")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(build_manifest_text(pdfs, output, target), encoding="utf-8")
+
+
+def _combine_inputs(
+    pre_toc_items: Sequence[InputItem],
+    manifest_items: Sequence[InputItem],
+    cli_items: Sequence[InputItem],
+) -> List[InputItem]:
+    """Build the final input list from the three sources.
+
+    A path given via ``--pre-toc`` is merged as an input in its own right. When
+    that same path is also named positionally or in the manifest, the richer
+    entry wins (keeping its label and inclusion flags) and merely gains
+    ``pre_toc``; ``toc`` then flips to False unless the manifest stated it.
+    """
+    ordered: List[InputItem] = []
+    by_path: dict[str, InputItem] = {}
+    for item in [*manifest_items, *cli_items]:
+        key = _path_key(item["path"])
+        if key in by_path:
+            continue  # same file listed twice: keep the first entry
+        by_path[key] = item
+        ordered.append(item)
+
+    added_pre_toc: List[InputItem] = []
+    for item in pre_toc_items:
+        key = _path_key(item["path"])
+        existing = by_path.get(key)
+        if existing is not None:
+            existing["pre_toc"] = True
+            if not existing["toc_explicit"]:
+                existing["toc"] = False
+            continue
+        by_path[key] = item
+        added_pre_toc.append(item)
+
+    # Pre-ToC files introduced by the flag lead, in flag order.
+    return [*added_pre_toc, *ordered]
+
+
+def _open_reader(path: Path) -> PdfReader:
+    """Open an input PDF, decrypting empty-password documents.
+
+    ``PdfReader.decrypt`` reports failure through its return value rather than
+    by raising, so the result has to be inspected: otherwise a genuinely
+    password-protected file slips through and fails later with an opaque error.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing file: {path}")
+    reader = PdfReader(str(path))
+    if reader.is_encrypted:
+        try:
+            result = reader.decrypt("")  # type: ignore[no-untyped-call]
+        except Exception as e:
+            raise ValueError(f"Encrypted PDF requires a password: {path}") from e
+        if not result:
+            raise ValueError(f"Encrypted PDF requires a password: {path}")
+    return reader
+
+
+def _toc_capacity() -> int:
+    """How many entries fit on the single ToC page."""
+    _, height = TOC_PAGE_SIZE
+    first = height - TOC_MARGIN - 2 * TOC_LINE_GAP
+    floor = TOC_MARGIN + TOC_LINE_GAP
+    if first < floor:
+        return 0
+    return int((first - floor) // TOC_LINE_GAP) + 1
+
+
+def _toc_row_positions(count: int) -> List[float]:
+    """Text baselines for the first ``count`` ToC rows, top to bottom."""
+    _, height = TOC_PAGE_SIZE
+    first = height - TOC_MARGIN - 2 * TOC_LINE_GAP
+    return [first - i * TOC_LINE_GAP for i in range(min(count, _toc_capacity()))]
 
 
 def _build_toc_pdf(entries: Sequence[tuple[str, int]]) -> PdfReader:
@@ -235,48 +418,40 @@ def _build_toc_pdf(entries: Sequence[tuple[str, int]]) -> PdfReader:
         )
 
     buf = io.BytesIO()
-    pagesize = (
-        letter if letter is not None else (612.0, 792.0)
-    )  # fallback to US Letter pts
-    c = canvas.Canvas(buf, pagesize=pagesize)
+    width, height = TOC_PAGE_SIZE
+    c = canvas.Canvas(buf, pagesize=(width, height))
 
-    width, height = pagesize
-    left = 54
-    right = width - 54
-    top = height - 54
-    line_gap = 16
+    left = TOC_MARGIN
+    right = width - TOC_MARGIN
 
     # Title
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(left, top, "Table of Contents")
+    c.setFont(*TOC_TITLE_FONT)
+    c.drawString(left, height - TOC_MARGIN, TOC_TITLE)
 
     # Entries
-    y = top - 2 * line_gap
-    c.setFont("Helvetica", 11)
+    font_name, font_size = TOC_ENTRY_FONT
+    c.setFont(font_name, font_size)
 
-    max_title_width = right - left - 60  # leave room for page numbers
-    for title, page_num in entries:
-        if y < 54 + line_gap:  # simple one-page clamp
-            break
+    max_title_width = right - left - TOC_PAGE_NUMBER_GUTTER
+    for y, (title, page_num) in zip(_toc_row_positions(len(entries)), entries):
         # Truncate title if too wide
         text = title
-        while c.stringWidth(text, "Helvetica", 11) > max_title_width and len(text) > 3:
+        while (
+            c.stringWidth(text, font_name, font_size) > max_title_width
+            and len(text) > 3
+        ):
             text = text[:-4] + "…"
-        # Dotted leader
-        title_x = left
         page_str = str(page_num)
-        page_w = c.stringWidth(page_str, "Helvetica", 11)
-        number_x = right - page_w
-        c.drawString(title_x, y, text)
+        number_x = right - c.stringWidth(page_str, font_name, font_size)
+        c.drawString(left, y, text)
         # draw dots between end of title and page number
-        dots_start = title_x + c.stringWidth(text, "Helvetica", 11) + 6
+        dots_start = left + c.stringWidth(text, font_name, font_size) + 6
         dots_end = number_x - 6
         if dots_end > dots_start:
-            dot_w = c.stringWidth(".", "Helvetica", 11)
+            dot_w = c.stringWidth(".", font_name, font_size)
             n_dots = int((dots_end - dots_start) / dot_w)
             c.drawString(dots_start, y, "." * max(0, n_dots))
         c.drawString(number_x, y, page_str)
-        y -= line_gap
 
     c.showPage()
     c.save()
@@ -284,32 +459,50 @@ def _build_toc_pdf(entries: Sequence[tuple[str, int]]) -> PdfReader:
     return PdfReader(buf)
 
 
-def _collapse_top_level_outlines(writer: PdfWriter) -> None:
-    try:
-        root = writer.get_outline_root()
-    except Exception:
-        return
-    if not root:
-        return
+def _add_toc_links(
+    writer: PdfWriter, toc_page_index: int, destinations: Sequence[int]
+) -> None:
+    """Overlay a clickable rectangle on each rendered ToC row."""
+    width, _ = TOC_PAGE_SIZE
+    left = TOC_MARGIN
+    right = width - TOC_MARGIN
+    for y, dest in zip(_toc_row_positions(len(destinations)), destinations):
+        annotation = Link(
+            rect=(left, y - 2.0, right, y + 12.0),
+            target_page_index=dest,
+            fit=Fit(fit_type="/Fit"),
+        )
+        writer.add_annotation(page_number=toc_page_index, annotation=annotation)
 
-    current = root.get("/First") if hasattr(root, "get") else None
-    while current is not None:
-        node = current.get_object()
-        if node is None or not hasattr(node, "__getitem__"):
-            break
-        node[NameObject("/%is_open%")] = BooleanObject(False)
 
-        child = node.get("/First") if hasattr(node, "get") else None
-        count = 0
-        while child is not None:
-            child_obj = child.get_object()
-            if child_obj is None:
-                break
-            count += 1
-            child = child_obj.get("/Next") if hasattr(child_obj, "get") else None
+def _collect_toc_entries(
+    pre_tocs: Sequence[InputItem],
+    normals: Sequence[InputItem],
+    reader_for: Callable[[InputItem], PdfReader],
+) -> List[tuple[str, int]]:
+    """Build (title, 1-based page number) rows for the ToC.
 
-        node[NameObject("/Count")] = NumberObject(-count if count else 0)
-        current = node.get("/Next") if hasattr(node, "get") else None
+    Pre-ToC items sit before the ToC page and so count from page 1; everything
+    else is offset by the pre-ToC pages plus the single ToC page.
+    """
+    entries: List[tuple[str, int]] = []
+
+    pre_pages_total = 0
+    for item in pre_tocs:
+        count = len(reader_for(item).pages)
+        if item["toc"]:
+            entries.append((_item_title(item), 1 + pre_pages_total))
+        pre_pages_total += count
+
+    first_normal_page = pre_pages_total + 1 + 1  # pre-ToC pages + ToC page + 1-based
+    running = 0
+    for item in normals:
+        count = len(reader_for(item).pages)
+        if item["toc"]:
+            entries.append((_item_title(item), first_normal_page + running))
+        running += count
+
+    return entries
 
 
 def merge_pdfs(
@@ -331,485 +524,330 @@ def merge_pdfs(
     if output_resolved in input_paths:
         raise ValueError("Output path must be different from all input paths.")
 
-    writer: PdfWriter = PdfWriter()
+    # Each input is read once and reused for both the page-count pass and the
+    # merge pass.
+    readers: dict[str, PdfReader] = {}
+
+    def reader_for(item: InputItem) -> PdfReader:
+        key = _path_key(item["path"])
+        reader = readers.get(key)
+        if reader is None:
+            reader = _open_reader(item["path"])
+            readers[key] = reader
+        return reader
 
     # Separate pre-ToC (formerly covers) and normal items
-    pre_tocs: List[InputItem] = [it for it in inputs if it.get("pre_toc", False)]
-    normals: List[InputItem] = [it for it in inputs if not it.get("pre_toc", False)]
+    pre_tocs: List[InputItem] = [it for it in inputs if it["pre_toc"]]
+    normals: List[InputItem] = [it for it in inputs if not it["pre_toc"]]
 
-    # Prepare ToC entries excluding covers; ToC will be inserted after covers
-    toc_pages = 0
-    toc_page_index: int | None = None
+    # ToC entries are computed up front: page numbers have to be known before
+    # any page is written.
     toc_entries: List[tuple[str, int]] = []
-    destinations: List[int] = (
-        []
-    )  # start pages (0-based) for ToC-linked normal items only
-
-    pre_pages_total = 0
-    pre_titles: List[str] = []
-    pre_counts: List[int] = []
-    pre_include_flags: List[bool] = []  # include in ToC if toc is True
     if add_toc:
-        # Count pre-ToC pages and compute include flags for pre-ToC items
-        for item in pre_tocs:
-            path = item["path"]
-            if not path.is_file():
-                raise FileNotFoundError(f"Missing file: {path}")
-            reader = PdfReader(str(path))
-            if reader.is_encrypted:
-                try:
-                    reader.decrypt("")  # type: ignore[no-untyped-call]
-                except Exception as e:
-                    raise ValueError(
-                        f"Encrypted PDF requires a password: {path}"
-                    ) from e
-            cnt = len(reader.pages)
-            pre_counts.append(cnt)
-            pre_pages_total += cnt
-            pre_titles.append(item["label"] if item["label"] else path.stem)
-            include_pre = bool(item.get("toc", False))
-            pre_include_flags.append(include_pre)
-
-        # Build ToC entries: first any included pre-ToC items (page numbers before the ToC page)
-        running_pre = 0
-        for idx, (title, count) in enumerate(zip(pre_titles, pre_counts)):
-            if pre_include_flags[idx]:
-                toc_entries.append((title, 1 + running_pre))
-            running_pre += count
-
-        # Build ToC entries for normal items (page numbers after ToC page)
-        titles: List[str] = []
-        page_counts: List[int] = []
-        include_flags: List[bool] = []
-        for item in normals:
-            path = item["path"]
-            if not path.is_file():
-                raise FileNotFoundError(f"Missing file: {path}")
-            reader = PdfReader(str(path))
-            if reader.is_encrypted:
-                try:
-                    reader.decrypt("")  # type: ignore[no-untyped-call]
-                except Exception as e:
-                    raise ValueError(
-                        f"Encrypted PDF requires a password: {path}"
-                    ) from e
-            page_counts.append(len(reader.pages))
-            titles.append(item["label"] if item["label"] else path.stem)
-            include_flags.append(bool(item.get("toc", True)))
-
-        start_page_normals = (
-            pre_pages_total + 1 + 1
-        )  # pre-ToC pages + ToC page + 1-based
-        running = 0
-        for idx, (title, count) in enumerate(zip(titles, page_counts)):
-            if include_flags[idx]:
-                toc_entries.append((title, start_page_normals + running))
-            running += count
-
-    # Utilities to import outlines from a reader into writer preserving fits
-    def _normalize_fit_args_local(fit: str, raw_args: list[Any]) -> tuple[Any, ...]:
-        def _num(v: Any) -> Any:
-            try:
-                return float(v)
-            except Exception:
-                return None
-
-        counts = {
-            "/Fit": 0,
-            "/FitB": 0,
-            "/FitH": 1,
-            "/FitBH": 1,
-            "/FitV": 1,
-            "/FitBV": 1,
-            "/XYZ": 3,
-            "/FitR": 4,
-        }
-        n = counts.get(fit, 0)
-        vals = [_num(x) for x in raw_args[:n]]
-        while len(vals) < n:
-            vals.append(None)
-        return tuple(vals)
-
-    def _parse_dest_array_local(
-        reader: PdfReader, dest: list[Any]
-    ) -> tuple[int | None, str | None, tuple[Any, ...] | None]:
-        try:
-            if dest:
-                page_ref: Any = dest[0]
-                page_idx: int | None = reader.get_page_number(page_ref)
-                fit: str = str(dest[1]) if len(dest) >= 2 else "/Fit"
-                raw_args: list[Any] = list(dest[2:]) if len(dest) > 2 else []
-                fit_args = _normalize_fit_args_local(fit, raw_args)
-                return page_idx, fit, fit_args
-        except Exception:
-            pass
-        return None, None, None
-
-    def _resolve_target_local(
-        reader: PdfReader, d: dict[str, Any]
-    ) -> tuple[int | None, str | None, tuple[Any, ...] | None]:
-        if "/Dest" in d:
-            dest: Any = d["/Dest"]
-            if isinstance(dest, (str, bytes)):
-                nd: Any = None
-                try:
-                    nd = reader.named_destinations.get(dest)  # type: ignore[attr-defined]
-                except Exception:
-                    try:
-                        nd = reader.getNamedDestinations().get(dest)  # type: ignore[attr-defined]
-                    except Exception:
-                        nd = None
-                if nd is not None:
-                    try:
-                        idx: int | None = reader.get_destination_page_number(nd)  # type: ignore[arg-type]
-                    except Exception:
-                        idx = None
-                    nd_any: Any = nd
-                    nd_fit: str = getattr(nd_any, "fit", "/Fit")  # type: ignore[assignment]
-                    nd_fit_args_val: Any = getattr(nd_any, "fit_args", ())
-                    nd_fit_args = _normalize_fit_args_local(
-                        nd_fit,
-                        (
-                            list(nd_fit_args_val)
-                            if isinstance(nd_fit_args_val, (list, tuple))
-                            else []
-                        ),
-                    )
-                    return idx, nd_fit, nd_fit_args
-            if isinstance(dest, list):
-                try:
-                    arr_idx, arr_fit, arr_fit_args = _parse_dest_array_local(
-                        reader, dest
-                    )
-                except Exception:
-                    arr_idx, arr_fit, arr_fit_args = None, None, None
-                if arr_idx is not None:
-                    return arr_idx, arr_fit or "/Fit", arr_fit_args
-
-        a: Any = d.get("/A")
-        if (
-            isinstance(a, dict)
-            and a.get("/S") == "/GoTo"
-            and "/D" in a
-            and isinstance(a["/D"], list)
-        ):
-            act_idx, act_fit, act_fit_args = _parse_dest_array_local(reader, a["/D"])
-            if act_idx is not None:
-                return act_idx, act_fit or "/Fit", act_fit_args
-
-        if "/Type" in d and "/Page" in d:
-            try:
-                page_idx = reader.get_page_number(d["/Page"])  # type: ignore[arg-type]
-            except Exception:
-                page_idx = None
-            fit_name = str(d.get("/Type", "/Fit"))
-            if fit_name == "/XYZ":
-                args_list: list[Any] = [d.get("/Left"), d.get("/Top"), d.get("/Zoom")]
-            elif fit_name in ("/FitH", "/FitBH"):
-                args_list = [d.get("/Top")]
-            elif fit_name in ("/FitV", "/FitBV"):
-                args_list = [d.get("/Left")]
-            elif fit_name == "/FitR":
-                args_list = [
-                    d.get("/Left"),
-                    d.get("/Bottom"),
-                    d.get("/Right"),
-                    d.get("/Top"),
-                ]
-            elif fit_name in ("/Fit", "/FitB"):
-                args_list = []
-            else:
-                args_list = []
-            fit_args = _normalize_fit_args_local(fit_name, args_list)
-            return page_idx, fit_name, fit_args
-
-        if "/Page" in d:
-            try:
-                idx = reader.get_page_number(d["/Page"])  # type: ignore[arg-type]
-                return idx, "/Fit", ()
-            except Exception:
-                pass
-        return None, None, None
-
-    def _fit_obj_local(fit: str | None, fit_args: tuple[Any, ...] | None) -> Fit:
-        return Fit(fit_type=fit or "/Fit", fit_args=fit_args or ())
-
-    def _import_outline_from_reader(
-        reader: PdfReader, writer_target: PdfWriter, page_offset: int
-    ) -> None:
-        outline: Any = getattr(reader, "outline", None) or getattr(
-            reader, "outlines", None
-        )
-        if outline is None:
-            try:
-                outline = list(reader.get_outlines())  # type: ignore[attr-defined]
-            except Exception:
-                outline = None
-        if outline is None:
-            return
-
-        # Flatten approach mirroring debug: iterate tree and recreate
-        def _recreate(readerL: PdfReader, outlineL: Any, parent: Any | None) -> None:
-            try:
-                nodes: list[Any] = (
-                    list(outlineL) if not isinstance(outlineL, list) else list(outlineL)
-                )
-            except Exception:
-                nodes = [outlineL]
-
-            last_created: Any | None = None
-            for node in nodes:
-                if isinstance(node, list):
-                    if last_created is not None:
-                        _recreate(readerL, node, last_created)
-                    continue
-
-                if isinstance(node, dict):
-                    title = str(node.get("/Title", "Untitled"))
-                    idx, fit, fit_args = _resolve_target_local(readerL, node)
-                    if idx is not None:
-                        last_created = writer_target.add_outline_item(
-                            title=title,
-                            page_number=page_offset + int(idx),
-                            parent=parent,
-                            fit=_fit_obj_local(fit, fit_args),
-                        )
-                    else:
-                        last_created = writer_target.add_outline_item(
-                            title=title, page_number=0, parent=parent
-                        )
-                else:
-                    # Fallback object-like
-                    title = (
-                        getattr(node, "title", None)
-                        or getattr(node, "name", None)
-                        or "Untitled"
-                    )
-                    try:
-                        idx2 = readerL.get_destination_page_number(node)  # type: ignore[arg-type]
-                    except Exception:
-                        idx2 = None
-                    fit2 = getattr(node, "fit", "/Fit")
-                    fit_args_val: Any = getattr(node, "fit_args", ())
-                    fit_args2 = _normalize_fit_args_local(
-                        fit2,
-                        (
-                            list(fit_args_val)
-                            if isinstance(fit_args_val, (list, tuple))
-                            else []
-                        ),
-                    )
-                    if idx2 is not None:
-                        last_created = writer_target.add_outline_item(
-                            title=str(title),
-                            page_number=page_offset + int(idx2),
-                            parent=parent,
-                            fit=_fit_obj_local(fit2, fit_args2),
-                        )
-                    else:
-                        last_created = writer_target.add_outline_item(
-                            title=str(title), page_number=0, parent=parent
-                        )
-
-        _recreate(reader, outline, None)
-
-    # First, append pre-ToC items (with outline labels unless outline_exclude)
-    for i, item in enumerate(pre_tocs):
-        path: Path = item["path"]
-        if not path.is_file():
-            raise FileNotFoundError(f"Missing file: {path}")
-
-        reader_orig: PdfReader = PdfReader(str(path))
-        if reader_orig.is_encrypted:
-            try:
-                reader_orig.decrypt("")  # type: ignore[no-untyped-call]
-            except Exception as e:
-                raise ValueError(f"Encrypted PDF requires a password: {path}") from e
-
-        # index where this item starts
-        start_index: int = len(writer.pages)
-
-        if not bool(item.get("outline", True)):
-            # Append pages only; no outline for this item
-            for page in reader_orig.pages:
-                writer.add_page(page)
-        else:
-            # Preprocess this input to rebuild its outline under a top-level label
-            title_str = item.get("label") or path.stem
-            single_writer: PdfWriter = rebuild_outline_under_parent(
-                reader_orig, label=str(title_str)
+        toc_entries = _collect_toc_entries(pre_tocs, normals, reader_for)
+        capacity = _toc_capacity()
+        if len(toc_entries) > capacity:
+            raise ValueError(
+                f"Table of Contents does not fit on one page: {len(toc_entries)} "
+                f"entries, at most {capacity} fit. Exclude entries with "
+                "'toc: false' in the manifest, or drop --toc."
             )
 
-            # Read the rebuilt PDF from memory to import pages and outlines
-            buf = io.BytesIO()
-            single_writer.write(buf)
-            buf.seek(0)
-            single_reader = PdfReader(buf)
+    writer: PdfWriter = PdfWriter()
+    destinations: List[int] = []  # start pages (0-based) for ToC-linked items
 
-            # Append pages
-            for page in single_reader.pages:
-                writer.add_page(page)
-
-            # Import the outlines (which already include the top-level label)
-            _import_outline_from_reader(single_reader, writer, page_offset=start_index)
-
-        # If ToC is enabled and this pre-ToC item is included in ToC, record destination now (order must match toc_entries)
-        if add_toc and i < len(pre_include_flags) and pre_include_flags[i]:
+    def append_item(item: InputItem) -> None:
+        reader = reader_for(item)
+        start_index = len(writer.pages)
+        if add_toc and item["toc"]:
             destinations.append(start_index)
 
+        if not item["outline"]:
+            # Append pages only; no outline for this item
+            for page in reader.pages:
+                writer.add_page(page)
+            return
+
+        # Rebuild this input's outline under a top-level label, then round-trip
+        # it through memory: the collapsed state only survives as the sign of
+        # /Count in a serialized document, and the rebuilt destinations only
+        # resolve once they have been written out and read back.
+        buf = io.BytesIO()
+        rebuild_outline_under_parent(reader, label=_item_title(item)).write(buf)
+        buf.seek(0)
+        rebuilt = PdfReader(buf)
+        for page in rebuilt.pages:
+            writer.add_page(page)
+        import_outline_from_reader(rebuilt, writer, page_offset=start_index)
+
+    # Pre-ToC items first, in order
+    for item in pre_tocs:
+        append_item(item)
+
     # Insert ToC after pre-ToC items
+    toc_page_index: int | None = None
     if add_toc and toc_entries:
         toc_reader = _build_toc_pdf(toc_entries)
         toc_page_index = len(writer.pages)
         for page in toc_reader.pages:
             writer.add_page(page)
-            toc_pages += 1
         # Optionally add an outline entry for the ToC itself (top-level)
         if toc_outline:
             writer.add_outline_item(
-                title="Table of Contents",
+                title=TOC_TITLE,
                 page_number=toc_page_index,
                 fit=Fit(fit_type="/Fit"),
             )
 
-    # Then append normal items (record destinations for ToC links when not excluded)
+    # Then the normal items
     for item in normals:
-        path: Path = item["path"]
-        if not path.is_file():
-            raise FileNotFoundError(f"Missing file: {path}")
-
-        reader_orig: PdfReader = PdfReader(str(path))
-        if reader_orig.is_encrypted:
-            try:
-                reader_orig.decrypt("")  # type: ignore[no-untyped-call]
-            except Exception as e:
-                raise ValueError(f"Encrypted PDF requires a password: {path}") from e
-
-        # index of the first page from this normal file
-        start_index: int = len(writer.pages)
-        if add_toc and bool(item.get("toc", True)):
-            destinations.append(start_index)
-
-        # Append pages and optionally import outline
-        if not bool(item.get("outline", True)):
-            for page in reader_orig.pages:
-                writer.add_page(page)
-        else:
-            title: str = str(item.get("label") or path.stem)
-            single_writer: PdfWriter = rebuild_outline_under_parent(
-                reader_orig, label=title
-            )
-            buf = io.BytesIO()
-            single_writer.write(buf)
-            buf.seek(0)
-            single_reader = PdfReader(buf)
-            for page in single_reader.pages:
-                writer.add_page(page)
-            _import_outline_from_reader(single_reader, writer, page_offset=start_index)
+        append_item(item)
 
     # Make ToC lines clickable (single-page ToC)
-    if add_toc and toc_pages > 0 and toc_page_index is not None:
-        # Must match _build_toc_pdf layout
-        pagesize = letter if letter is not None else (612.0, 792.0)
-        width, height = pagesize
-        left = 54
-        right = width - 54
-        top = height - 54
-        line_gap = 16
-
-        y = top - 2 * line_gap
-        for dest in destinations:
-            if y < 54 + line_gap:  # same clamp used in _build_toc_pdf
-                break
-            rect = (float(left), float(y - 2), float(right), float(y + 12))
-            annotation = Link(
-                rect=rect, target_page_index=dest, fit=Fit(fit_type="/Fit")
+    if toc_page_index is not None:
+        if len(destinations) != len(toc_entries):
+            raise RuntimeError(
+                "Internal error: ToC rows and link targets are out of step "
+                f"({len(toc_entries)} rows, {len(destinations)} targets)."
             )
-            writer.add_annotation(page_number=toc_page_index, annotation=annotation)
-            y -= line_gap
+        _add_toc_links(writer, toc_page_index, destinations)
 
-    _collapse_top_level_outlines(writer)
+    # Restate /Count across the whole tree so viewers honour the collapsed state.
+    update_outline_counts(writer)
 
-    output.parent.mkdir(parents=True, exist_ok=True)
+    output_resolved.parent.mkdir(parents=True, exist_ok=True)
     with open(output_resolved, "wb") as f:
         writer.write(f)
 
 
-def _parse_args() -> argparse.Namespace:
+DESCRIPTION = """\
+Merge two or more PDFs into one document, with an optional linked Table of
+Contents and an outline that nests each input's own bookmarks under a
+top-level label.
+
+Pick the inputs one of three ways: --here for every PDF in a folder, a manifest
+for an explicit order and custom labels, or plain file arguments.
+"""
+
+EPILOG = """\
+manifest keys (.json, .yml, .yaml)
+  A manifest is either a bare list of file entries, or an object with global
+  options plus a 'files' list. Paths inside it resolve against the manifest's
+  own folder. CLI flags win over manifest values.
+
+  global:
+    output, out    output PDF path
+    overwrite      replace the output if it exists (same as -f)
+    toc            true/false, or {enabled|include: bool, outline: bool}
+
+  per file:
+    file           path to the PDF (required)
+    label          outline title for this file      (default: the filename)
+    bookmark       deprecated alias for label
+    pre_toc        place this file before the ToC   (default: false)
+    toc            list this file in the ToC        (default: true, or false
+                                                     when pre_toc is true)
+    outline        give this file an outline entry  (default: true)
+
+examples
+  Merge everything in this folder, in Explorer's order, no ToC:
+    pdfmerge --here
+
+  Same, with a Table of Contents, replacing a previous run:
+    pdfmerge --here --toc -f
+
+  Another folder, without changing directory, naming the output:
+    pdfmerge --here "C:\\Cases\\Smith" --toc -o "Case 42.pdf"
+
+  Wrong order? Write a manifest, edit it, then merge:
+    pdfmerge --here --write-manifest
+    notepad manifest.yml
+    pdfmerge -m manifest.yml
+
+  A cover page ahead of the ToC, then the rest of the folder:
+    pdfmerge --here --toc --pre-toc cover.pdf
+
+  Explicit files, explicit output:
+    pdfmerge -o merged.pdf --toc A.pdf B.pdf
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Merge two or more PDF files into a single PDF (order is preserved)."
+        prog="pdfmerge",
+        description=DESCRIPTION,
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-o", "--output", required=False, help="Output PDF path.")
     parser.add_argument(
-        "-f", "--force", action="store_true", help="Overwrite output if it exists."
+        "--here",
+        nargs="?",
+        const=".",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Merge every PDF in a folder, ordered the way Windows Explorer "
+            "orders them. Defaults to the current folder; pass a path to work on "
+            "another one. Not recursive. Cannot be combined with -m or with file "
+            "arguments."
+        ),
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        required=False,
+        metavar="PATH",
+        help=(
+            "Output PDF path. Required unless --here or a manifest supplies one. "
+            "With --here the default is the folder's own name, e.g. C:\\Cases\\Smith "
+            "gives Smith.pdf, and a relative path is taken as relative to that "
+            "folder rather than to the current one."
+        ),
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help=(
+            "Overwrite the output if it exists (also replaces an existing file "
+            "when used with --write-manifest)."
+        ),
     )
     parser.add_argument(
         "-m",
         "--manifest",
+        metavar="PATH",
         help=(
-            "Path to manifest (.json, .yml, .yaml). Accepts either a list of files or "
-            "an object with options and a 'files' list. Options: output/out, overwrite, toc (bool or object with enabled/include + outline)."
+            "Read the file list and options from a manifest (.json, .yml, "
+            ".yaml). See 'manifest keys' below. CLI flags override it."
+        ),
+    )
+    parser.add_argument(
+        "--write-manifest",
+        nargs="?",
+        const="manifest.yml",
+        metavar="PATH",
+        help=(
+            "With --here: write an editable manifest listing the folder's PDFs "
+            "in order and exit without merging. Defaults to manifest.yml in that "
+            "same folder; use -f to replace an existing one."
         ),
     )
     parser.add_argument(
         "--toc",
         action="store_true",
-        help="Prepend a one-page Table of Contents listing each merged file.",
+        help=(
+            "Prepend a one-page Table of Contents with a clickable row per "
+            "merged file. Off by default. The page holds a fixed number of rows "
+            f"({_toc_capacity()} on US Letter); exceeding it is an error."
+        ),
     )
     parser.add_argument(
         "--toc-outline",
         action="store_true",
-        help=(
-            "Also add a top-level outline entry pointing to the ToC page (off by default)."
-        ),
+        help="Also add a top-level outline entry pointing at the ToC page. Off by default.",
     )
     parser.add_argument(
         "--pre-toc",
         action="append",
         dest="pre_toc",
         default=[],
+        metavar="PATH",
         help=(
-            "Mark a file to be placed before the ToC (pre-ToC). Defaults: included in outline, not in ToC."
+            "Merge a file before the ToC, e.g. a cover. Repeat the flag per "
+            "file; they lead in flag order. The flag merges the file on its own, "
+            "so do not repeat it as an argument. Such files get an outline label "
+            "but are left out of the ToC."
         ),
     )
-    # Renamed per-file CLI toggles (set inclusion to True for given paths)
-    # Fine-grained per-file ToC/outline inclusion is controlled in the manifest via per-file 'toc' and 'outline' booleans.
+    # Fine-grained per-file ToC/outline inclusion is controlled in the manifest
+    # via per-file 'toc' and 'outline' booleans.
     parser.add_argument(
         "inputs",
         nargs="*",
-        help="Additional input PDFs (after any manifest items), in order.",
+        metavar="PDF",
+        help="Input PDFs, in order, appended after any manifest entries.",
     )
-    return parser.parse_args()
+    return parser
 
 
-def main() -> None:
-    args = _parse_args()
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not (args.here or args.manifest or args.inputs or args.pre_toc):
+        parser.print_help()
+        raise SystemExit(1)
+
+    if args.here is not None and (args.manifest or args.inputs):
+        raise ValueError(
+            "--here merges the whole folder, so it cannot be combined with "
+            "-m/--manifest or with file arguments."
+        )
+    if args.write_manifest and args.here is None:
+        raise ValueError("--write-manifest is only available together with --here.")
+
+    here_dir: Path | None = None
+    if args.here is not None:
+        here_dir = Path(args.here).resolve()
+        if not here_dir.is_dir():
+            raise NotADirectoryError(f"--here needs a folder, got: {here_dir}")
 
     manifest_res: ManifestResult | None = (
         _load_manifest(Path(args.manifest)) if args.manifest else None
     )
     from_manifest: List[InputItem] = manifest_res["items"] if manifest_res else []
-    # CLI inputs parsed (labels default to filename; cover flags default False)
     from_cli: List[InputItem] = _inputs_from_cli(args.inputs)
+    from_pre_toc: List[InputItem] = _inputs_from_cli(
+        args.pre_toc, pre_toc=True, base=here_dir
+    )
 
-    # Merge lists preserving order, then mark pre-ToC items from CLI --pre-toc
-    all_inputs: List[InputItem] = [*from_manifest, *from_cli]
-    pre_toc_paths = set(_normalize_paths(getattr(args, "pre_toc", [])))
-    for it in all_inputs:
-        p = it["path"]
-        if p in pre_toc_paths:
-            it["pre_toc"] = True  # type: ignore[index]
-            # If flipped to pre_toc, default toc becomes False unless explicitly set in manifest
-            if "toc" not in it:
-                it["toc"] = False  # type: ignore[index]
-    # Resolve output path with precedence: CLI > manifest
-    out_path_val: Path | None = Path(args.output) if args.output else None
+    # Resolve output path with precedence: CLI > manifest > --here folder name.
+    # In folder mode a relative -o belongs to that folder, matching the default.
+    out_path_val: Path | None = None
+    if args.output:
+        out_path_val = Path(args.output)
+        if here_dir is not None and not out_path_val.is_absolute():
+            out_path_val = here_dir / out_path_val
     if out_path_val is None and manifest_res and manifest_res.get("output"):
         out_path_val = manifest_res["output"]
+    if out_path_val is None and here_dir is not None:
+        out_path_val = default_output_for(here_dir)
     if out_path_val is None:
         raise ValueError(
             "Output path must be provided via -o/--output or manifest 'output'."
         )
+
+    if here_dir is not None:
+        # The output must never be fed back into itself, and --pre-toc files
+        # are added separately so they can lead.
+        skip = [out_path_val.resolve(), *(it["path"] for it in from_pre_toc)]
+        from_cli = _inputs_from_directory(here_dir, exclude=skip)
+
+        if args.write_manifest:
+            target = Path(args.write_manifest)
+            if not target.is_absolute():
+                target = here_dir / target
+            pdfs = [it["path"] for it in [*from_pre_toc, *from_cli]]
+            if not pdfs:
+                raise ValueError(f"No PDFs found in {here_dir}.")
+            write_manifest(target, pdfs, out_path_val, overwrite=args.force)
+            print(f"Wrote {target} listing {len(pdfs)} PDFs. Edit it, then run:")
+            print(f"  pdfmerge -m {target.name}")
+            return
+
+        found = len(from_pre_toc) + len(from_cli)
+        if found < 2:
+            raise ValueError(
+                f"--here needs at least two PDFs in {here_dir}, found {found}. "
+                f"The output ({out_path_val.name}) is never merged into itself."
+            )
+
+    all_inputs: List[InputItem] = _combine_inputs(from_pre_toc, from_manifest, from_cli)
 
     # Resolve overwrite and toc flags with precedence: CLI true overrides, else manifest
     overwrite_final: bool = bool(
@@ -820,8 +858,7 @@ def main() -> None:
     )
     # ToC outline toggle (default False). CLI true overrides; else manifest toc_outline true enables
     toc_outline_final: bool = bool(
-        getattr(args, "toc_outline", False)
-        or (manifest_res and manifest_res.get("toc_outline") is True)
+        args.toc_outline or (manifest_res and manifest_res.get("toc_outline") is True)
     )
 
     merge_pdfs(
@@ -833,5 +870,20 @@ def main() -> None:
     )
 
 
+def cli() -> None:
+    """Console-script entry point: report failures as messages, not tracebacks."""
+    try:
+        main()
+    except (
+        ValueError,
+        FileNotFoundError,
+        FileExistsError,
+        ModuleNotFoundError,
+        OSError,
+    ) as e:
+        print(f"pdfmerge: {e}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
 if __name__ == "__main__":
-    main()
+    cli()

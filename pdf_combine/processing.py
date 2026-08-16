@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Iterable, cast
 
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import Fit, IndirectObject, NameObject, NumberObject, TreeObject
+from pypdf.generic import Fit, NameObject, NumberObject, TreeObject
 
 
 def _normalize_fit_args(fit: str, raw_args: list[Any]) -> tuple[Any, ...]:
@@ -53,12 +53,15 @@ def _resolve_target(
     if "/Dest" in d:
         dest: Any = d["/Dest"]
         if isinstance(dest, (str, bytes)):
+            dest_name: str = (
+                dest.decode("utf-8", "replace") if isinstance(dest, bytes) else dest
+            )
             nd: Any = None
             try:
-                nd = reader.named_destinations.get(dest)  # type: ignore[attr-defined]
+                nd = reader.named_destinations.get(dest_name)  # type: ignore[attr-defined]
             except Exception:
                 try:
-                    nd = reader.getNamedDestinations().get(dest)  # type: ignore[attr-defined]
+                    nd = reader.getNamedDestinations().get(dest_name)  # type: ignore[attr-defined]
                 except Exception:
                     nd = None
             if nd is not None:
@@ -146,12 +149,22 @@ def _fit_obj(fit: str | None, fit_args: tuple[Any, ...] | None) -> Fit:
 
 # --- Outline state helpers ---
 def is_outline_node_open(node: Any) -> bool:
+    """Report whether an outline node is expanded.
+
+    Handles both node flavours pypdf produces: reader-side ``Destination``
+    objects (which carry ``/Count``, negative when the node was collapsed) and
+    writer-side ``TreeObject`` items (which carry pypdf's internal
+    ``/%is_open%`` marker). The marker is a ``BooleanObject``, which does not
+    implement ``__bool__``, so it must be compared by value rather than passed
+    to ``bool()`` - pypdf's own tree code does the same.
+    """
     if isinstance(node, dict):
         node_dict = cast(dict[str, Any], node)
+        marker: Any = node_dict.get("/%is_open%")
+        if marker is not None:
+            return marker == True  # noqa: E712 - BooleanObject needs ==, not bool()
         count_val = node_dict.get("/Count")
         if isinstance(count_val, (int, float)):
-            return int(count_val) >= 0
-        if isinstance(count_val, NumberObject):
             return int(count_val) >= 0
     open_attr = getattr(cast(Any, node), "open", None)
     if isinstance(open_attr, bool):
@@ -162,13 +175,6 @@ def is_outline_node_open(node: Any) -> bool:
 def _tree_object_from(obj: Any) -> TreeObject | None:
     if isinstance(obj, TreeObject):
         return obj
-    if isinstance(obj, IndirectObject):
-        try:
-            real = obj.get_object()
-        except Exception:
-            return None
-        if isinstance(real, TreeObject):
-            return real
     if hasattr(obj, "get_object"):
         try:
             real = obj.get_object()
@@ -180,21 +186,26 @@ def _tree_object_from(obj: Any) -> TreeObject | None:
 
 
 def _recalculate_counts(node: TreeObject) -> int:
+    """Recompute ``/Count`` for ``node`` and its subtree, returning the number
+    of items that are visible when ``node`` itself is expanded.
+
+    Per PDF 32000-1 §12.3.3 that is the direct children plus the visible
+    descendants of any child that is itself open - not just the direct child
+    count. A collapsed node stores the same figure negated.
+    """
+    visible = 0
     child_ref: Any = node.get("/First")
-    count = 0
     while child_ref is not None:
         child_obj = _tree_object_from(child_ref)
         if child_obj is None:
             break
-        count += 1
-        _recalculate_counts(child_obj)
-        next_ref = child_obj.get("/Next")
-        child_ref = next_ref
+        below = _recalculate_counts(child_obj)
+        visible += 1 + (below if is_outline_node_open(child_obj) else 0)
+        child_ref = child_obj.get("/Next")
 
-    is_open = bool(node.get("/%is_open%", True))
-    sign = 1 if is_open or count == 0 else -1
-    node[NameObject("/Count")] = NumberObject(sign * count)
-    return count
+    sign = 1 if is_outline_node_open(node) else -1
+    node[NameObject("/Count")] = NumberObject(sign * visible)
+    return visible
 
 
 def update_outline_counts(writer: PdfWriter) -> None:
@@ -286,6 +297,7 @@ def _recreate_outline_under_parent(
     writer: PdfWriter,
     parent: Any,
     page_offset: int = 0,
+    skip_footnotes: bool = True,
 ) -> None:
     # Normalize to list of nodes
     try:
@@ -304,7 +316,7 @@ def _recreate_outline_under_parent(
         if isinstance(node, list):
             if last_created is not None:
                 _recreate_outline_under_parent(
-                    reader, node, writer, last_created, page_offset
+                    reader, node, writer, last_created, page_offset, skip_footnotes
                 )
             continue
 
@@ -313,7 +325,7 @@ def _recreate_outline_under_parent(
             title = str(node_dict.get("/Title", "Untitled"))
             idx, fit, fit_args = _resolve_target(reader, node_dict)
             # Skip footnote-like entries
-            if _is_footnote_entry(title, fit, fit_args):
+            if skip_footnotes and _is_footnote_entry(title, fit, fit_args):
                 continue
             if idx is not None:
                 last_created = writer.add_outline_item(
@@ -353,7 +365,7 @@ def _recreate_outline_under_parent(
                 ),
             )
             # Skip footnote-like entries
-            if _is_footnote_entry(str(title), fit2, fit_args2):
+            if skip_footnotes and _is_footnote_entry(str(title), fit2, fit_args2):
                 continue
             if idx2 is not None:
                 last_created = writer.add_outline_item(
@@ -370,6 +382,40 @@ def _recreate_outline_under_parent(
                     parent=parent,
                     is_open=is_outline_node_open(node),
                 )
+
+
+def _source_outline(reader: PdfReader) -> Any:
+    """Return the reader's outline tree, tolerating pypdf naming differences."""
+    outline: Any = getattr(reader, "outline", None) or getattr(reader, "outlines", None)
+    if outline is None:
+        try:
+            outline = list(reader.get_outlines())  # type: ignore[attr-defined]
+        except Exception:
+            outline = None
+    return outline
+
+
+def import_outline_from_reader(
+    reader: PdfReader,
+    writer: PdfWriter,
+    page_offset: int = 0,
+    parent: Any = None,
+    skip_footnotes: bool = False,
+) -> None:
+    """Copy ``reader``'s outline into ``writer``, shifted by ``page_offset``.
+
+    Destinations keep their original fit type and arguments, and each node
+    keeps its expanded/collapsed state. ``skip_footnotes`` defaults to False
+    here: callers merging an already-processed document must not re-apply the
+    footnote heuristic, or a top-level label that merely looks numeric (say a
+    file named ``12.pdf``) would be dropped.
+    """
+    outline = _source_outline(reader)
+    if not outline:
+        return
+    _recreate_outline_under_parent(
+        reader, outline, writer, parent, page_offset, skip_footnotes
+    )
 
 
 def rebuild_outline_under_parent(reader: PdfReader, label: str) -> PdfWriter:
@@ -400,17 +446,16 @@ def rebuild_outline_under_parent(reader: PdfReader, label: str) -> PdfWriter:
         is_open=False,
     )
 
-    # Source outline
-    outline: Any = getattr(reader, "outline", None) or getattr(reader, "outlines", None)
-    if outline is None:
-        try:
-            outline = list(reader.get_outlines())  # type: ignore[attr-defined]
-        except Exception:
-            outline = None
-
+    # Source outline, nested under the new top-level label
+    outline = _source_outline(reader)
     if outline:
-        _recreate_outline_under_parent(reader, outline, writer, parent, page_offset=0)
+        _recreate_outline_under_parent(
+            reader, outline, writer, parent, page_offset=0, skip_footnotes=True
+        )
 
+    # /%is_open% is stripped when pypdf serializes the document, so the
+    # collapsed state only survives a write/read round-trip through the sign of
+    # /Count. Recompute it here so callers can re-read this writer's output.
     update_outline_counts(writer)
 
     return writer

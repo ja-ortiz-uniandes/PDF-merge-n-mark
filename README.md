@@ -8,6 +8,7 @@ Combine multiple PDFs into a single document while preserving (and improving) na
 - Start every top-level outline collapsed so PDF viewers hide nested bookmarks until expanded.
 - Optionally place certain PDFs before the ToC (pre-ToC). By default these are omitted from the ToC but still get a label in the outline.
 - Fine-grained control over which items appear in the ToC and/or the outline via per-file manifest keys.
+- Merge a whole folder in one command, in the order Windows Explorer shows it.
 
 Powered by `pypdf` for PDF manipulation and `reportlab` for the ToC page.
 
@@ -17,23 +18,47 @@ Requirements:
 
 - Python `>= 3.13`
 
-Install dependencies:
+Install `pdfmerge` as a command available from any directory:
+
+```pwsh
+uv tool install --editable .
+uv tool update-shell   # only if ~\.local\bin is not already on PATH
+```
+
+`--editable` means later edits to this repo take effect immediately, with no
+reinstall. Adding a new *dependency* does need `uv tool install --editable . --force`.
+
+For development inside the repo, `uv sync` installs everything including the
+`dev` group (`mypy`, `pytest`):
 
 ```pwsh
 uv sync
+uv run pytest      # test suite
+uv run mypy .      # type check
 ```
 
-Dependencies (from `pyproject.toml`): `pypdf`, `pyyaml`, `reportlab`, `mypy` (dev).
+Every example below can also be run without installing, as
+`uv run merge_pdf.py ...` from the repo directory.
 
 ## Quick Start
 
-Minimal CLI merge (two or more files):
+Merge every PDF in the folder you are standing in:
 
 ```pwsh
-uv run merge_pdf.py -o .\merged.pdf --toc ".\A.pdf" ".\B.pdf"
+cd C:\Cases\Smith
+pdfmerge --here
 ```
 
-Using a manifest (YAML):
+That writes `Smith.pdf` (the folder's own name), no ToC, files in Explorer's
+order. Add `--toc` for a linked Table of Contents.
+
+Merge specific files:
+
+```pwsh
+pdfmerge -o .\merged.pdf --toc ".\A.pdf" ".\B.pdf"
+```
+
+Or drive it from a manifest (YAML):
 
 ```yaml
 output: "merged.pdf"
@@ -46,41 +71,72 @@ files:
     label: "Section B"
 ```
 
-Run:
+```pwsh
+pdfmerge -m .\manifest.yml
+```
+
+## Merging a Whole Folder
 
 ```pwsh
-uv run merge_pdf.py -m .\manifest.yml
+pdfmerge --here                    # all PDFs here -> <folder-name>.pdf, no ToC
+pdfmerge --here --toc -f           # same, with a ToC, replacing a previous run
+pdfmerge --here --toc --pre-toc cover.pdf   # cover first, then the ToC, then the rest
+pdfmerge --here "C:\Cases\Smith" --toc      # another folder, no cd needed
 ```
+
+- `--here` takes an optional folder; with none, it uses the current one.
+- The scan is **not** recursive: only PDFs directly inside the folder.
+- Order matches Windows Explorer's Name column, so `1 Intro.pdf`, `2 Body.pdf`,
+  `10 Annex.pdf` merge in that order rather than `1, 10, 2`. (On non-Windows
+  systems a close approximation is used.)
+- The output file is never merged into itself, so re-running with `-f` is safe.
+- `-o` overrides the folder-name default. **In folder mode, a relative path is
+  relative to the folder being merged**, not to where you are standing, so
+  `pdfmerge --here "C:\Cases\Smith" -o "Case 42.pdf"` writes
+  `C:\Cases\Smith\Case 42.pdf`. The same goes for a bare `--pre-toc cover.pdf`.
+  Absolute paths are used as given.
+- `--here` cannot be combined with `-m` or with file arguments: those describe
+  an explicit set of files.
+
+### When the folder order is wrong
+
+Write a manifest listing the folder, edit it, then merge:
+
+```pwsh
+pdfmerge --here --write-manifest   # -> manifest.yml, nothing merged
+notepad manifest.yml               # reorder, relabel, delete entries
+pdfmerge -m manifest.yml
+```
+
+`--write-manifest` takes an optional filename (`--write-manifest order.yml`) and
+refuses to replace an existing file without `-f`. The manifest is written into
+the folder being merged, beside the files it lists, so its entries stay short
+and the folder can be moved as a unit.
 
 ## CLI Usage
 
-```text
-merge_pdf.py [-o OUTPUT] [-f] [-m MANIFEST] [--toc] [--toc-outline]
-             [--pre-toc PATH] [--pre-toc PATH] ...
-             [inputs ...]
-```
-
-- `-o, --output` (required unless provided by manifest): Path to the output PDF.
-- `-f, --force`: Overwrite the output if it already exists.
-- `-m, --manifest`: Path to a manifest (`.json`, `.yml`, `.yaml`).
-- `--toc`: Prepend a one-page Table of Contents.
-- `--toc-outline`: Also add a top-level outline entry pointing to the ToC page (off by default).
-- `--pre-toc <path>`: Mark a file to be placed before the ToC (pre-ToC). Use one flag per file; repeat the flag for multiple files.
-- `inputs`: Additional input PDFs in order.
+`pdfmerge --help` is the full reference: every flag, every manifest key, and
+worked examples. The notes below cover the parts worth spelling out.
 
 Notes on `--pre-toc`:
 
 - The flag accepts exactly one path per use (repeat the flag for multiple files).
-- Only files passed via `--pre-toc` are placed before the ToC. All other positional inputs are appended after the ToC page (when `--toc` is used).
+- The file is merged by the flag alone: it does not need to be repeated as a positional input.
+- Files passed via `--pre-toc` lead the document, in flag order. All other positional inputs are appended after the ToC page (when `--toc` is used).
+- Naming a path that is also a positional input or a manifest entry merges it once: it keeps its manifest `label`, `toc` and `outline` settings and simply moves before the ToC. Its `toc` then defaults to `false` unless the manifest states it.
 
 Precedence rules:
 
 - CLI options override manifest options where applicable (e.g., `--toc`, `--toc-outline`, `-f`).
 - The output path can come from CLI or manifest; CLI takes precedence.
 
-### Running `pdfmerge` Globally on Windows (PowerShell)
+### Alternative: a PowerShell function instead of installing
 
-You can set up a PowerShell function so that the `pdfmerge` command is available in any directory. This allows you to keep the code inside the project, always run the latest version, and pass input files (like `manifest.yml`) from your current working folder.
+`uv tool install --editable .` (see [Installation](#installation)) is the
+recommended route: it puts a real `pdfmerge` on PATH that works in PowerShell,
+`cmd`, Git Bash and IDE terminals alike. If you would rather not install
+anything, a PowerShell profile function gives the same command in PowerShell
+only.
 
 #### 1. Open your PowerShell profile
 
@@ -97,10 +153,10 @@ Paste this into the profile file, adjusting the path to where your project is lo
 
 ```ps
 function pdfmerge {
-    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Args)
+    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments)
     $proj   = "PATH_TO_PROJECT\PDF-merge-n-mark"
     $script = "$proj\merge_pdf.py"
-    uv run --project $proj python $script @Args
+    uv run --project $proj python $script @Arguments
 }
 ```
 
@@ -205,7 +261,7 @@ JSON:
 - `file` (string): Path to the PDF.
 - `label` (string | null): Top-level outline title for the file (defaults to filename stem). Alias: `bookmark`. (CLI-only merges use the filename stem; custom labels require a manifest.)
 - `pre_toc` (bool): Place the file before the ToC. Default behavior: included in outline and omitted from ToC.
-- `toc` (bool): Include this item in the ToC (defaults to true; if `pre_toc: true`, defaults to false).
+- `toc` (bool): Include this item in the ToC (defaults to true; if `pre_toc: true`, defaults to false). Must be a boolean here: the object form belongs to the top-level `toc` key.
 - `outline` (bool): Include this item in the outline (defaults to true).
 
 ### Global keys (object-style manifest)
@@ -223,6 +279,7 @@ JSON:
 - Pre-ToC files are inserted first, in order. By default they are not listed in the ToC and they get a top-level outline label.
 - Default pre-ToC behavior: pre-ToC items are omitted from the ToC unless `toc: true` is set for that item; they still receive an outline label unless `outline: false`.
 - The ToC (if enabled) is inserted immediately after pre-ToC items and before normal files. It’s a single page with clickable links to included items.
+- The ToC is exactly one page, so it holds a limited number of entries (40 on US Letter). Asking for more is an error rather than a silent truncation; exclude entries with `toc: false` to fit.
 - ToC page numbers are 1-based; pre-ToC entries (when included) count from 1; normal entries account for pre-ToC pages + the ToC page.
 - A top-level outline label is created per input (unless excluded), and each input’s original outline is preserved under that label with original view/fit behavior (`/XYZ`, `/FitH`, `/FitV`, `/FitR`, `/Fit`, `/FitB`, `/FitBH`, `/FitBV`). These newly created top-level labels start collapsed by default so you can expand only the sections you need.
 - The ToC itself can have a top-level outline entry when `toc.outline: true` (or CLI `--toc-outline`).
@@ -234,9 +291,9 @@ JSON:
 1. CLI only, with ToC, pre-ToC items, and ToC outline entry (repeat `--pre-toc` for each pre-ToC file):
 
 ```pwsh
-uv run merge_pdf.py -o .\merged.pdf --toc --toc-outline \
-  --pre-toc .\intro.pdf \
-  --pre-toc .\license.pdf \
+pdfmerge -o .\merged.pdf --toc --toc-outline `
+  --pre-toc .\intro.pdf `
+  --pre-toc .\license.pdf `
   .\A.pdf .\B.pdf
 ```
 
@@ -288,21 +345,37 @@ Defaults summary:
   - `outline`: defaults to `true`
   - `toc`: defaults to `true`, except when `pre_toc: true` then defaults to `false`
 
+## License
+
+MIT - see [`LICENSE`](LICENSE). Use it, change it, ship it commercially; just
+keep the copyright notice. Dependencies are permissive too (`pypdf` BSD-3-Clause,
+`reportlab` BSD, `PyYAML` MIT), so nothing here is copyleft.
+
 ## Troubleshooting
 
 - If you see an error about the output file existing, add `-f` or set `overwrite: true` in the manifest.
 - If ToC links don’t appear, ensure `reportlab` is installed and you passed `--toc` or `toc: true`.
-- If a PDF is encrypted, supply a decrypted copy or remove it from the manifest.
+- If a PDF is encrypted, supply a decrypted copy or remove it from the manifest. Only an empty password is attempted.
+- If the merge stops with “Table of Contents does not fit on one page”, drop entries with `toc: false` or turn the ToC off.
 
 ## Installation & Running (recap)
 
 ```pwsh
-# Install dependencies (Python >= 3.13)
-uv sync
+# Install the pdfmerge command (Python >= 3.13)
+uv tool install --editable .
 
-# Run with CLI only
-uv run python .\merge_pdf.py -o .\merged.pdf --toc .\A.pdf .\B.pdf
+# Merge the folder you are standing in
+pdfmerge --here --toc
 
-# Run with a manifest
-uv run python .\merge_pdf.py -m .\manifest.yml
+# Explicit files
+pdfmerge -o .\merged.pdf --toc .\A.pdf .\B.pdf
+
+# From a manifest
+pdfmerge -m .\manifest.yml
+
+# Full reference
+pdfmerge --help
 ```
+
+Without installing, from the repo directory: `uv sync`, then
+`uv run merge_pdf.py ...` in place of `pdfmerge ...`.
