@@ -18,6 +18,8 @@ uv tool install --editable . --force                 # refresh the global `pdfme
 
 There is no lint config. `main.py` is a leftover `uv init` stub, not an entry point.
 
+Outstanding work lives in `TODO.md`, not here.
+
 The shipped command is `pdfmerge`, declared as `[project.scripts] pdfmerge = "merge_pdf:cli"` and installed with `uv tool install --editable .`. Because it is editable, working-tree edits apply with no reinstall; a **new dependency** does need the `--force` reinstall above. Note the tool's own environment resolves deps fresh rather than from `uv.lock`, so it can run a newer `pypdf` than the tests do - worth a `uv run --with 'pypdf==<newer>' pytest` when that matters.
 
 `merge_pdf.py` has two entry points: `main(argv=None)` raises on failure and is what tests call, while `cli()` wraps it to print `pdfmerge: <message>` and exit 1. Console users must never see a traceback.
