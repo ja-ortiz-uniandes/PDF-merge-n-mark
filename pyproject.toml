@@ -1,6 +1,6 @@
 [project]
 name = "pdf-merge-n-mark"
-version = "1.2.0"
+version = "1.2.1"
 description = "Merge PDFs into one document with a linked Table of Contents and a preserved, nested outline"
 readme = "README.md"
 requires-python = ">=3.13"

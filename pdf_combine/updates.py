@@ -69,7 +69,9 @@ def _read_cache(path: Path) -> dict[str, Any]:
 def _write_cache(path: Path, payload: dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)  # atomic: concurrent writers can't tear the file
     except Exception:
         pass  # a cache we cannot write is not worth an error
 

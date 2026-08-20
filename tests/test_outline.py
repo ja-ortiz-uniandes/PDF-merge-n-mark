@@ -156,6 +156,42 @@ def test_footnote_entries_are_dropped_from_the_source_outline(
     assert titles(body["children"]) == ["Real Subsection"]
 
 
+def test_footnote_with_children_drops_the_children_too(
+    tmp_path: Path, make_pdf: Callable[..., Path]
+):
+    """A dropped footnote's own children used to be silently reparented onto
+    the previous surviving sibling instead of being dropped with it."""
+    outline = [
+        {
+            "title": "Body",
+            "page": 0,
+            "children": [
+                {"title": "Real Subsection", "page": 0},
+                {
+                    "title": "1",
+                    "page": 0,
+                    "children": [{"title": "Detail", "page": 0}],
+                },
+                {"title": "Another Section", "page": 0},
+            ],
+        }
+    ]
+    a = make_pdf("A", pages=1, outline=outline)
+    b = make_pdf("B", pages=1)
+    out = tmp_path / "merged.pdf"
+
+    merge_pdf.main(["-o", str(out), str(a), str(b)])
+
+    tree = outline_tree(PdfReader(str(out)))
+    body = find_node(tree, "Body")
+    assert body is not None
+    assert titles(body["children"]) == ["Real Subsection", "Another Section"]
+    real_subsection = find_node(tree, "Real Subsection")
+    assert real_subsection is not None
+    assert titles(real_subsection["children"]) == []
+    assert find_node(tree, "Detail") is None
+
+
 def test_numeric_filename_still_gets_a_top_level_label(
     tmp_path: Path, make_pdf: Callable[..., Path]
 ):

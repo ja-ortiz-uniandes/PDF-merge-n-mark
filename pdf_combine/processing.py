@@ -311,14 +311,24 @@ def _recreate_outline_under_parent(
         nodes = [cast(Any, outline)]
 
     last_created: Any = None
+    skip_next_children = False
 
     for node in nodes:
         if isinstance(node, list):
+            # A list immediately follows the node it belongs to (its
+            # children). If that node was itself dropped, its children must
+            # be dropped too, not reparented onto the previous surviving
+            # sibling.
+            if skip_next_children:
+                skip_next_children = False
+                continue
             if last_created is not None:
                 _recreate_outline_under_parent(
                     reader, node, writer, last_created, page_offset, skip_footnotes
                 )
             continue
+
+        skip_next_children = False
 
         if isinstance(node, dict):
             node_dict = cast(dict[str, Any], node)
@@ -326,6 +336,7 @@ def _recreate_outline_under_parent(
             idx, fit, fit_args = _resolve_target(reader, node_dict)
             # Skip footnote-like entries
             if skip_footnotes and _is_footnote_entry(title, fit, fit_args):
+                skip_next_children = True
                 continue
             if idx is not None:
                 last_created = writer.add_outline_item(
@@ -366,6 +377,7 @@ def _recreate_outline_under_parent(
             )
             # Skip footnote-like entries
             if skip_footnotes and _is_footnote_entry(str(title), fit2, fit_args2):
+                skip_next_children = True
                 continue
             if idx2 is not None:
                 last_created = writer.add_outline_item(

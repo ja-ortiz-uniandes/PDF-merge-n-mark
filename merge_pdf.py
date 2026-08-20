@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable, List, Sequence, TypedDict
 import yaml  # type: ignore[import-not-found]
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link  # type: ignore[import-not-found]
+from pypdf.errors import PyPdfError  # type: ignore[import-not-found]
 from pypdf.generic import Fit  # type: ignore[import-not-found]
 
 from pdf_combine.marking import installed_version, is_our_output, stamp_output
@@ -109,7 +110,10 @@ def _load_manifest(path: Path) -> ManifestResult:
     if path.suffix.lower() == ".json":
         data = json.loads(text)
     elif path.suffix.lower() in {".yml", ".yaml"}:
-        data = yaml.safe_load(text)
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML manifest: {path}: {e}") from e
     else:
         raise ValueError("Manifest must be .json, .yml, or .yaml")
 
@@ -406,7 +410,10 @@ def _open_reader(path: Path) -> PdfReader:
     """
     if not path.is_file():
         raise FileNotFoundError(f"Missing file: {path}")
-    reader = PdfReader(str(path))
+    try:
+        reader = PdfReader(str(path))
+    except PyPdfError as e:
+        raise ValueError(f"Not a valid PDF: {path}: {e}") from e
     if reader.is_encrypted:
         try:
             result = reader.decrypt("")  # type: ignore[no-untyped-call]
@@ -572,6 +579,12 @@ def merge_pdfs(
     toc_entries: List[tuple[str, int]] = []
     if add_toc:
         toc_entries = _collect_toc_entries(pre_tocs, normals, reader_for)
+        if not toc_entries:
+            raise ValueError(
+                "Table of Contents requested but no inputs are eligible for it "
+                "(all are 'pre_toc' or 'toc: false'). Include at least one "
+                "toc-eligible file, or drop --toc."
+            )
         capacity = _toc_capacity()
         if len(toc_entries) > capacity:
             raise ValueError(

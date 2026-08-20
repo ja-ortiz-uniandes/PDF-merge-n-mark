@@ -219,6 +219,18 @@ def test_version_flag_reports_the_installed_version(
     assert installed_version() in out
 
 
+def test_write_cache_is_atomic(tmp_path: Path):
+    """Writes go through a temp file + rename, so a reader never observes a
+    partially-written (truncated) cache file, and no temp file is left
+    behind."""
+    cache = tmp_path / "c.json"
+
+    updates._write_cache(cache, {"latest": "v1.3.0"})
+
+    assert json.loads(cache.read_text(encoding="utf-8")) == {"latest": "v1.3.0"}
+    assert list(tmp_path.iterdir()) == [cache]
+
+
 def test_notify_never_raises(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv(updates.OPT_OUT_ENV, raising=False)
 

@@ -255,6 +255,41 @@ def test_single_input_is_rejected(tmp_path: Path, make_pdf: Callable[..., Path])
         merge_pdf.main(["-o", str(tmp_path / "merged.pdf"), str(a)])
 
 
+def test_invalid_yaml_manifest_raises_cleanly(tmp_path: Path):
+    """A YAML syntax error must surface as ValueError, not a raw traceback."""
+    manifest = tmp_path / "m.yml"
+    manifest.write_text("files: [\n  - file: a.pdf\n bad indent: [\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid YAML manifest"):
+        merge_pdf.main(["-m", str(manifest)])
+
+
+def test_corrupt_pdf_input_raises_cleanly(tmp_path: Path, make_pdf: Callable[..., Path]):
+    """A file that isn't actually a PDF must surface as ValueError, not a
+    raw pypdf traceback."""
+    fake = tmp_path / "fake.pdf"
+    fake.write_text("not a pdf", encoding="utf-8")
+    b = make_pdf("B", pages=1)
+    out = tmp_path / "merged.pdf"
+
+    with pytest.raises(ValueError, match="Not a valid PDF"):
+        merge_pdf.main(["-o", str(out), str(fake), str(b)])
+
+
+def test_toc_with_no_eligible_entries_raises(
+    tmp_path: Path, make_pdf: Callable[..., Path]
+):
+    """--toc with only pre-toc inputs used to produce no ToC page, silently."""
+    pre_a = make_pdf("A", pages=1)
+    pre_b = make_pdf("B", pages=1)
+    out = tmp_path / "merged.pdf"
+
+    with pytest.raises(ValueError, match="no inputs are eligible"):
+        merge_pdf.main(
+            ["-o", str(out), "--toc", "--pre-toc", str(pre_a), "--pre-toc", str(pre_b)]
+        )
+
+
 def test_existing_output_needs_force(tmp_path: Path, make_pdf: Callable[..., Path]):
     a = make_pdf("A", pages=1)
     b = make_pdf("B", pages=1)
